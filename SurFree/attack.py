@@ -22,7 +22,6 @@ from dataset.target_class_dataset import ImageNetDataset,CIFAR100Dataset,CIFAR10
 import math
 import dct as torch_dct
 
-
 def atleast_kdim(x, ndim):
     shape = x.shape + (1,) * (ndim - len(x.shape))
     return x.reshape(shape)
@@ -30,7 +29,7 @@ def atleast_kdim(x, ndim):
 class SurFree(object):
     def __init__(self, model, dataset, clip_min, clip_max, height, width, channels, batch_size, epsilon, norm,
                 maximum_queries=10000, BS_gamma: float = 0.01, quantification=True, theta_max: float = 30,
-                max_queries: int = 5000, BS_max_iteration: int = 7,steps: int = 100, n_ortho: int = 100, clip=True,
+                BS_max_iteration: int = 7, steps: int = 100, n_ortho: int = 100, clip=True,
                 rho: float = 0.95, T: int = 1, with_alpha_line_search: bool = True, with_distance_line_search: bool = False,
                 with_interpolation: bool = False, final_line_search: bool=True,):
         self.model = model
@@ -47,9 +46,10 @@ class SurFree(object):
         self.shape = (channels, height, width)
 
         # Attack Parameters
+        self._steps = steps
         self._BS_gamma = BS_gamma
         self._theta_max = theta_max
-        self._max_queries = max_queries
+        # self._max_queries = max_queries
         self._BS_max_iteration = BS_max_iteration
         self._steps = steps
         self.clip = clip
@@ -69,7 +69,7 @@ class SurFree(object):
         self.dataset_loader = DataLoaderMaker.get_test_attacked_data(dataset, batch_size)
         self.batch_size = batch_size
         self.total_images = len(self.dataset_loader.dataset)
-        self.query_all = torch.zeros(self.total_images)  # 查询次数
+        self.query_all = torch.zeros(self.total_images)
         self.distortion_all = defaultdict(OrderedDict)  # key is image index, value is {query: distortion}
         self.correct_all = torch.zeros_like(self.query_all)  # number of images
         self.not_done_all = torch.zeros_like(self.query_all)  # always set to 0 if the original image is misclassified
@@ -133,6 +133,7 @@ class SurFree(object):
         sample: the shape of sample is [C,H,W] without batch-size
         Efficient Implementation of BlendedUniformNoiseAttack in Foolbox.
         """
+        sample = sample.unsqueeze(0)
         num_eval = 0
         if target_images is None:
             while True:
@@ -153,7 +154,7 @@ class SurFree(object):
                                                                 size=target_labels[invalid_target_index].size()).long()
                             invalid_target_index = target_labels.eq(true_labels)
 
-                    initialization = self.get_image_of_target_class(self.dataset_name,target_labels, self.model).squeeze()
+                    initialization = self.get_image_of_target_class(self.dataset_name, [target_labels], self.model).squeeze()
                     return initialization, 1
                 # assert num_eval < 1e4, "Initialization failed! Use a misclassified image as `target_image`"
             # Binary search to minimize l2 distance to original image.
@@ -174,6 +175,23 @@ class SurFree(object):
             initialization = target_images
         return initialization, num_eval
 
+    def batch_initialize(self, samples, target_images, true_labels, target_labels):
+        initialization = samples.clone()
+        num_evals = torch.zeros_like(true_labels).float()
+
+        with torch.no_grad():
+            logit = self.model(samples.cuda())
+        pred = logit.argmax(dim=1)
+        correct = pred.eq(true_labels.cuda()).float()
+        for i in range(len(correct)):
+            if correct[i]:
+                if target_images is None:
+                    initialization[i], num_evals[i] = self.initialize(samples[i], None, true_labels[i], None)
+                else:
+                    initialization[i], num_evals[i] = self.initialize(samples[i], target_images[i], true_labels[i], target_labels[i])
+
+        return initialization, num_evals
+
     def distance(self, a, b):
         return (a - b).flatten(1).norm(dim=1)
 
@@ -189,7 +207,10 @@ class SurFree(object):
         # Count if the vector is different from the null vector
         if self.quantification:
             perturbed = self._quantify(perturbed)
-        is_advs = self.model(perturbed.cuda()).argmax(1).detach().cpu() != self.label
+        if self.target_labels is not None:
+            is_advs = self.model(perturbed.cuda()).argmax(1).detach().cpu() == self.target_labels
+        else:
+            is_advs = self.model(perturbed.cuda()).argmax(1).detach().cpu() != self.label
 
         indexes = []
         for i, p in enumerate(perturbed):
@@ -197,7 +218,7 @@ class SurFree(object):
                 self._nqueries[i] += 1
                 indexes.append(i)
 
-        self._images_finished = self._nqueries > self._max_queries
+        self._images_finished = self._nqueries > self.maximum_queries
         return is_advs
 
     def _get_candidates(self):
@@ -439,10 +460,9 @@ class SurFree(object):
         self.theta_max = torch.ones(len(images)).to(images.device) * self._theta_max
 
         self.label = true_labels
-
         self.X = images
+        self.target_labels = target_labels
         batch_size = images.size(0)
-        # true_labels = true_labels.cuda()
 
         query = torch.zeros_like(true_labels).float()
         success_stop_queries = query.clone()  # stop query count once the distortion < epsilon
@@ -451,8 +471,8 @@ class SurFree(object):
 
         # self.best_advs = torch.where(atleast_kdim(self._images_finished, len(X.shape)), X, self.best_advs)
         # self.best_advs = self._binary_search(self.best_advs, boost=True)
-        self.best_advs, num_evals = self.initialize(self.X, target_images, true_labels, target_labels)
-        # x_adv = x_adv.cuda()
+        self.best_advs, num_evals = self.batch_initialize(self.X, target_images, true_labels, target_labels)
+        # self.best_advs = get_init_with_noise(model, X, labels) if starting_points is None else starting_points
         query += num_evals
         self._nqueries += num_evals
         dist = torch.norm((self.best_advs - images).view(batch_size, -1), self.ord, 1)
@@ -463,11 +483,14 @@ class SurFree(object):
                 inside_batch_index].item()
 
         # Check if X are already adversarials.
-        self._images_finished = model(images.cuda()).argmax(1).detach().cpu() != true_labels
+        if target_labels is None:
+            self._images_finished = model(images.cuda()).argmax(1).detach().cpu() != true_labels
+        else:
+            self._images_finished = model(images.cuda()).argmax(1).detach().cpu() == target_labels
 
         print("Already advs: ", self._images_finished.cpu().tolist())
         self.best_advs = torch.where(atleast_kdim(self._images_finished, len(images.shape)), images, self.best_advs)
-        self.best_advs = self._binary_search(self.best_advs, boost=True)
+        # self.best_advs = self._binary_search(self.best_advs, boost=True)
 
         # Initialize the direction orthogonalized with the first direction
         fd = self.best_advs - self.X
@@ -476,9 +499,7 @@ class SurFree(object):
         # Load Basis
         self._basis = Basis(self.X, **kwargs["basis_params"]) if "basis_params" in kwargs else Basis(self.X)
 
-        # for step_i in range(self._steps):
-        #     print("Step:", step_i)
-        while query < self.maximum_queries:
+        while min(query) < self.maximum_queries:
             # Get candidates. Shape: (n_candidates, batch_size, image_size)
             candidates = self._get_candidates()
             candidates = candidates.transpose(1, 0)
@@ -504,16 +525,22 @@ class SurFree(object):
                 self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[
                     inside_batch_index].item()
 
-            # print("Best Advs distance:", self.distance(images, self.best_advs).cpu().numpy())
-            log.info('{}-th image, {}: distortion {:.4f}, query: {}'.format(batch_index+1, self.norm, dist.item(), int(query[0].item())))
+            log.info('Attacking image {} - {} / {}, query {}, distortion {}'.format(
+                batch_index * args.batch_size, (batch_index + 1) * args.batch_size, self.total_images, query, dist))
 
-            if self._images_finished.all():
-                print("Max queries attained for all the images.")
-                break
+            # if self._images_finished.all():
+            #     print("Max queries attained for all the images.")
+            #     break
 
             # log.info('{}-th image, {}: distortion {:.4f}, query: {}'.format(batch_index+1, self.norm, dist.item(), int(query[0].item())))
             # if dist.item() < 1e-4:  # 发现攻击jpeg时候卡住，故意加上这句话
             #     break
+        if self.final_line_search:
+            self.best_advs = self._binary_search(self.best_advs,  boost=True)
+
+        #print("Final adversarial", self._criterion_is_adversarial(self.best_advs).raw.cpu().tolist())
+        if self.quantification:
+            self.best_advs = self._quantify(self.best_advs)
 
         success_stop_queries = torch.clamp(success_stop_queries, 0, self.maximum_queries)
         return self.best_advs, query, success_stop_queries, dist, (dist <= self.epsilon)
@@ -686,7 +713,6 @@ class Basis:
             function: str = "tanh",
             tanh_gamma: float = 1
     ) -> None:
-
         if not hasattr(self, "_get_vector_" + self.basis_type):
             raise ValueError("Basis {} doesn't exist.".format(self.basis_type))
 
@@ -794,7 +820,7 @@ if __name__ == "__main__":
                         help='a configures file to be passed in instead of arguments')
     parser.add_argument('--epsilon', type=float, help='the lp perturbation bound')
     parser.add_argument("--norm",type=str, choices=["l2","linf"],required=True)
-    parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--batch-size', type=int, default=100)
     parser.add_argument('--dataset', type=str, required=True,
                choices=['CIFAR-10', 'CIFAR-100', 'ImageNet', "FashionMNIST", "MNIST", "TinyImageNet"], help='which dataset to use')
     parser.add_argument('--arch', default=None, type=str, help='network architecture')
@@ -808,11 +834,6 @@ if __name__ == "__main__":
     parser.add_argument('--defense-norm',type=str,choices=["l2","linf"],default='linf')
     parser.add_argument('--defense-eps',type=str,default="")
     parser.add_argument('--max-queries',type=int, default=10000)
-    parser.add_argument(
-        "--config_path",
-        default="config_example.json",
-        help="Configuration Path with all the parameter for SurFree. It have to be a dict with the keys init and run."
-        )
 
     args = parser.parse_args()
     # assert args.batch_size == 1, "Triangle Attack only supports mini-batch size equals 1!"
@@ -822,9 +843,11 @@ if __name__ == "__main__":
     if not args.json_config:
         # If there is no json file, all of the args must be given
         args_dict = vars(args)
+        config = {"init": {}, "run": {"epsilons": None}}
     else:
         # If a json file is given, use the JSON file as the base, and then update it with args
         defaults = json.load(open(args.json_config))[args.dataset][args.norm]
+        config = json.load(open(args.json_config, "r"))
         arg_vars = vars(args)
         arg_vars = {k: arg_vars[k] for k in arg_vars if arg_vars[k] is not None}
         defaults.update(arg_vars)
@@ -869,12 +892,12 @@ if __name__ == "__main__":
         assert args.arch is not None
         archs = [args.arch]
 
-    if args.json_config is not None:
-        if not os.path.exists(args.config_path):
-            raise ValueError("{} doesn't exist.".format(args.config_path))
-        config = json.load(open(args.config_path, "r"))
-    else:
-        config = {"init": {}, "run": {"epsilons": None}}
+    # if args.json_config is not None:
+    #     if not os.path.exists(args.config_path):
+    #         raise ValueError("{} doesn't exist.".format(args.config_path))
+    #     config = json.load(open(args.config_path, "r"))
+    # else:
+    #     config = {"init": {}, "run": {"epsilons": None}}
 
     args.arch = ", ".join(archs)
     log.info('Command line is: {}'.format(' '.join(sys.argv)))
