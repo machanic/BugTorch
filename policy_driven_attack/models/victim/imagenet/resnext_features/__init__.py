@@ -1,1 +1,0 @@
-from models.victim.imagenet.resnext_features.resnext101_32x4d_features import resnext101_32x4d_features

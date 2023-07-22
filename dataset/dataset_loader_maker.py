@@ -469,8 +469,8 @@ class DataLoaderMaker(object):
         return loader
 
     @staticmethod
-    def get_test_attacked_data(datasetname, batch_size):
-        dataset = NpzDataset(datasetname)
+    def get_test_attacked_data(datasetname, batch_size,use_image_id=False):
+        dataset = NpzDataset(datasetname,use_image_id)
         loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, num_workers=0, shuffle=False)
         return loader
 

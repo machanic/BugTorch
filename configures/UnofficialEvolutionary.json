@@ -1,0 +1,57 @@
+{"CIFAR-10": {
+      "l2":{
+        "epsilon": 1.0,
+        "channel": 3,
+        "length": 15,
+        "k": 5
+        },
+      "linf": {
+        "epsilon": 0.031372,
+        "channel": 3,
+        "length": 15,
+        "k": 5
+      }
+  },
+    "CIFAR-100": {
+      "l2":{
+          "epsilon": 1.0,
+           "channel": 3,
+           "length": 15,
+           "k": 5
+        },
+      "linf": {
+          "epsilon": 0.031372,
+           "channel": 3,
+           "length": 15,
+           "k": 5
+      }
+  },
+  "TinyImageNet": {
+      "l2":{
+          "epsilon": 2.0,
+          "channel": 3,
+          "length": 45,
+          "k": 1
+        },
+      "linf": {
+          "epsilon": 0.031372,
+          "channel": 3,
+          "length": 45,
+          "k": 1
+      }
+  },
+    "ImageNet": {
+        "l2":{
+              "epsilon": 10.0,
+              "channel": 3,
+              "length": 45,
+              "k": 1
+        },
+        "linf": {
+              "epsilon": 0.05,
+              "channel": 3,
+              "length": 45,
+              "k": 1
+        }
+    }
+}

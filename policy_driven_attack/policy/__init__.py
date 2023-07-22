@@ -1,4 +1,0 @@
-import policy_driven_attack.policy.debug
-import policy_driven_attack.policy.mnist
-import policy_driven_attack.policy.cifar
-import policy_driven_attack.policy.imagenet

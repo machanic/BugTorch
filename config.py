@@ -4,9 +4,11 @@ IMAGE_SIZE = {"CIFAR-10":(32,32), "CIFAR-100":(32,32), "ImageNet":(299,299), "MN
 IN_CHANNELS = {"MNIST":1, "FashionMNIST":1, "CIFAR-10":3, "ImageNet":3, "CIFAR-100":3, "SVHN":3, "TinyImageNet":3}
 CLASS_NUM = {"MNIST":10,"FashionMNIST":10, "CIFAR-10":10, "CIFAR-100":100, "ImageNet":1000, "SVHN":10, "TinyImageNet":200}
 
-PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
-HOME_ROOT = os.path.dirname(PROJECT_PATH)
+# PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
+# HOME_ROOT = os.path.dirname(PROJECT_PATH)
 
+PROJECT_PATH = "/public/ch/xxj/attack/"
+HOME_ROOT = os.path.dirname(PROJECT_PATH)
 
 IMAGE_DATA_ROOT = {"CIFAR-10":"{}/dataset/CIFAR-10".format(HOME_ROOT), "CIFAR-100":"{}/dataset/CIFAR-100".format(HOME_ROOT),
                    'cifar10':"{}/dataset/CIFAR-10".format(HOME_ROOT),
@@ -31,8 +33,8 @@ pretrained_cifar_model_conf = {"CIFAR-10":{
                                "resnet-110":{"depth":110, "epochs":164, "schedule":[81,122], "gamma":0.1, "wd":1e-4, "block_name":"BasicBlock"},
                                "resnet-1202":{"depth":1202,"epochs":164, "schedule":[81,122], "gamma":0.1, "wd":1e-4, "block_name":"BasicBlock"},
                                "preresnet-110":{"depth":110,"epochs":164, "schedule":[81,122], "gamma":0.1, "wd":1e-4,  "block_name":"BasicBlock"},
-                                "resnext-8x64d":{"depth":29, "cardinality":8, "widen_factor":4, "schedule":[150,225],"wd":5e-4,"gamma":0.1, "drop":0},
-                                "resnext-16x64d":{"depth":29, "cardinality":16, "widen_factor":4, "schedule":[150,225],"wd":5e-4,"gamma":0.1,  "drop":0},
+                                "resnext-29-8x64d":{"depth":29, "cardinality":8, "widen_factor":4, "schedule":[150,225],"wd":5e-4,"gamma":0.1, "drop":0},
+                                "resnext-29-16x64d":{"depth":29, "cardinality":16, "widen_factor":4, "schedule":[150,225],"wd":5e-4,"gamma":0.1,  "drop":0},
                                 "WRN-28-10":{"depth":28, "widen_factor":10, "drop":0.0,"epochs":200, "schedule":[60,120,160], "wd":5e-4, "gamma":0.2},
                                 "WRN-28-10-drop":{"depth":28, "widen_factor":10, "drop":0.3,"epochs":200, "schedule":[60,120,160], "wd":5e-4, "gamma":0.2},
                                 "WRN-34-10":{"depth":34, "widen_factor":10, "drop":0.0,"epochs":200, "schedule":[60,120,160], "wd":5e-4, "gamma":0.2},
@@ -59,8 +61,8 @@ pretrained_cifar_model_conf = {"CIFAR-10":{
                                 "resnet-110":{"depth":110, "epochs":164, "schedule":[81,122], "gamma":0.1, "wd":1e-4, "block_name":"BasicBlock"},
                                "resnet-1202":{"depth":1202,"epochs":164, "schedule":[81,122], "gamma":0.1, "wd":1e-4, "block_name":"BasicBlock"},
                                "preresnet-110":{"depth":110,"epochs":164, "schedule":[81,122], "gamma":0.1, "wd":1e-4,  "block_name":"BasicBlock"},
-                                "resnext-8x64d":{"depth":29, "cardinality":8, "widen_factor":4, "schedule":[150,225],"wd":5e-4,"gamma":0.1, "drop":0},
-                                "resnext-16x64d":{"depth":29, "cardinality":16, "widen_factor":4, "schedule":[150,225],"wd":5e-4,"gamma":0.1, "drop":0},
+                                "resnext-29-8x64d":{"depth":29, "cardinality":8, "widen_factor":4, "schedule":[150,225],"wd":5e-4,"gamma":0.1, "drop":0},
+                                "resnext-29-16x64d":{"depth":29, "cardinality":16, "widen_factor":4, "schedule":[150,225],"wd":5e-4,"gamma":0.1, "drop":0},
                                 "WRN-28-10":{"depth":28, "widen_factor":10, "drop":0.0,"epochs":200, "schedule":[60,120,160], "wd":5e-4, "gamma":0.2},
                                 "WRN-28-10-drop":{"depth":28, "widen_factor":10, "drop":0.3,"epochs":200, "schedule":[60,120,160], "wd":5e-4, "gamma":0.2},
                                 "WRN-34-10":{"depth":34, "widen_factor":10, "drop":0.0,"epochs":200, "schedule":[60,120,160], "wd":5e-4, "gamma":0.2},
@@ -83,10 +85,10 @@ pretrained_cifar_model_conf = {"CIFAR-10":{
 IMAGENET_ALL_MODELS = ["inception_v3","pnasnet5large","senet154","inceptionv4","xception","resnet101"]
 
 MODELS_TRAIN_STANDARD = {"CIFAR-10": ["alexnet", "densenet-bc-100-12", "densenet-bc-L190-k40",  "preresnet-110",
-                                      "resnext-16x64d","resnext-8x64d","vgg19_bn","resnet-20","resnet-32","resnet-44","resnet-50",
+                                      "resnext-29-16x64d","resnext-29-8x64d","vgg19_bn","resnet-20","resnet-32","resnet-44","resnet-50",
                                           "resnet-56","resnet-110","resnet-1202"],
                          "CIFAR-100": ["alexnet", "densenet-bc-100-12", "densenet-bc-L190-k40",  "preresnet-110",
-                                      "resnext-16x64d","resnext-8x64d","vgg19_bn","resnet-20","resnet-32","resnet-44","resnet-50",
+                                      "resnext-29-16x64d","resnext-29-8x64d","vgg19_bn","resnet-20","resnet-32","resnet-44","resnet-50",
                                           "resnet-56","resnet-110","resnet-1202"],
                          "ImageNet": ["alexnet", "bninception","densenet121", "densenet161","densenet169", "densenet201","dpn68",
                                      "resnext101_32x4d","resnext101_64x4d","se_resnext101_32x4d",
@@ -103,9 +105,9 @@ MODELS_TEST_STANDARD = {"CIFAR-10": ["pyramidnet272", "gdas","WRN-28-10-drop","W
 
 
 MODELS_TRAIN_WITHOUT_RESNET = {"CIFAR-10": ["alexnet", "densenet-bc-100-12", "densenet-bc-L190-k40",  "preresnet-110",
-                                      "resnext-16x64d","resnext-8x64d","vgg19_bn"],
+                                      "resnext-29-16x64d","resnext-29-8x64d","vgg19_bn"],
                          "CIFAR-100": ["alexnet", "densenet-bc-100-12", "densenet-bc-L190-k40",  "preresnet-110",
-                                      "resnext-16x64d","resnext-8x64d","vgg19_bn"],
+                                      "resnext-29-16x64d","resnext-29-8x64d","vgg19_bn"],
                          "ImageNet": ["alexnet", "bninception","densenet121", "densenet161","densenet169", "densenet201","dpn68",
                                      "resnext101_32x4d","resnext101_64x4d","se_resnext101_32x4d",
                                       "se_resnext50_32x4d","squeezenet1_0","squeezenet1_1","vgg11","vgg11_bn","vgg13_bn","vgg13",

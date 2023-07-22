@@ -1,0 +1,57 @@
+
+{"CIFAR-10": {
+      "l2":{
+          "epsilon": 1.0
+        },
+      "linf": {
+          "epsilon": 0.031372
+      }
+  },
+    "CIFAR-100": {
+      "l2":{
+          "epsilon": 1.0
+        },
+      "linf": {
+          "epsilon": 0.031372
+      }
+  },
+  "TinyImageNet": {
+      "l2":{
+          "epsilon": 2.0
+        },
+      "linf": {
+          "epsilon": 0.031372
+      }
+  },
+    "ImageNet": {
+        "l2":{
+            "epsilon": 10.0
+        },
+        "linf": {
+            "epsilon": 0.05
+        }
+    },
+      "run": {
+        "epsilons": [null],
+        "basis_params": {
+            "basis_type": "dct",
+	        "dct_type": "full",
+            "function": "constant",
+            "frequence_range": [0, 0.5]
+        }
+    },
+    "init": {
+        "steps": 50,
+        "max_queries": 500,
+        "BS_gamma": 0.01,
+        "BS_max_iteration": 10,
+        "rho": 0.98,
+	    "T": 1,
+        "theta_max": 30,
+        "n_ortho": 10,
+        "with_distance_line_search": false,
+        "with_interpolation": false,
+        "with_alpha_line_search": true,
+        "quantification": false
+    }
+}

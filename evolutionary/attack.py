@@ -1,47 +1,68 @@
+# -*- coding: gbk -*-
+import argparse
+
 import os
+import random
 import sys
-from collections import defaultdict, OrderedDict, deque
 
-import cv2
+
+sys.path.append(os.getcwd())
+from collections import defaultdict, OrderedDict
+import json
+from types import SimpleNamespace
+import os.path as osp
 import torch
-import tempfile
 import numpy as np
-# use MPI Spawn to start workers
-from mpi4py import MPI
-
-from dataset.dataset_loader_maker import DataLoaderMaker
 import glog as log
+from torch.distributions.multivariate_normal import MultivariateNormal
+from torch.nn import functional as F
+from config import CLASS_NUM, MODELS_TEST_STANDARD, IN_CHANNELS, IMAGE_DATA_ROOT
+from dataset.dataset_loader_maker import DataLoaderMaker
+from models.standard_model import StandardModel
+from models.defensive_model import DefensiveModel
+from dataset.target_class_dataset import ImageNetDataset,CIFAR100Dataset,CIFAR10Dataset,TinyImageNetDataset
 
 class Evolutionary(object):
-    ''' Evolutionary. A black-box decision-based method.
-    - Supported distance metric: ``l_2``.
-    - Supported goal: ``t``, ``tm``, ``ut``.
-    - References: https://arxiv.org/abs/1904.04433.
-    '''
-
-    def __init__(self, model, dataset, batch_size, clip_min, clip_max, targeted, maximum_queries, dimension_reduction=None):
-        ''' Initialize Evolutionary.
-        :param model: The model to attack. A ``realsafe.model.Classifier`` instance.
-        :param batch_size: Batch size for the ``batch_attack()`` method.
-        :param dimension_reduction: ``(height, width)``.
-        :param iteration_callback: A function accept a ``xs`` ``tf.Tensor`` (the original examples) and a ``xs_adv``
-            ``tf.Tensor`` (the adversarial examples for ``xs``). During ``batch_attack()``, this callback function would
-            be runned after each iteration, and its return value would be yielded back to the caller. By default,
-            ``iteration_callback`` is ``None``.
-        '''
-        self.model, self.batch_size = model, batch_size
-        self.dataset_loader = DataLoaderMaker.get_test_attacked_data(dataset, batch_size)
-        self.total_images = len(self.dataset_loader.dataset)
+    def __init__(self, model, dataset, clip_min, clip_max, height, width, channels, norm, epsilon,
+                 ccov=0.001, decay_weight=0.99, max_queries=10000, mu=0.01, sigma=3e-2, maxlen=30,
+                 maximum_queries=10000, batch_size=1):
+        """
+        :param clip_min: lower bound of the image.
+        :param clip_max: upper bound of the image.
+        :param norm: choose between [l2, linf].
+        :param iterations: number of iterations.
+        :param gamma: used to set binary search threshold theta. The binary search
+                     threshold theta is gamma / d^{3/2} for l2 attack and gamma / d^2 for linf attack.
+        :param max_num_evals: maximum number of evaluations for estimating gradient.
+        :param init_num_evals: initial number of evaluations for estimating gradient.
+        """
+        self.model = model
+        self.norm = norm
+        self.ord = np.inf if self.norm == "linf" else 2
+        self.epsilon = epsilon
         self.clip_min = clip_min
         self.clip_max = clip_max
-        self.targeted = targeted
-        self.maximum_queries = maximum_queries
-        self.dimension_reduction = dimension_reduction
-        if self.dimension_reduction is not None:
-            # to avoid import tensorflow in other processes, we cast the dimension to basic type
-            self.dimension_reduction = (int(self.dimension_reduction[0]), int(self.dimension_reduction[1]))
+        self.height = height
+        self.width = width
+        self.channels = channels
+        self.shape = (channels, height, width)
 
-        self.query_all = torch.zeros(self.total_images)
+        self.model = model
+        self.ccov = ccov
+        self.decay_weight = decay_weight
+        self.max_queries = max_queries
+        self.mu = mu
+        self.sigma = sigma
+        self.maxlen = maxlen
+        self.min_value = 0
+        self.max_value = 1
+
+        self.maximum_queries = maximum_queries
+        self.dataset_name = dataset
+        self.dataset_loader = DataLoaderMaker.get_test_attacked_data(dataset, batch_size)
+        self.batch_size = batch_size
+        self.total_images = len(self.dataset_loader.dataset)
+        self.query_all = torch.zeros(self.total_images) # query times
         self.distortion_all = defaultdict(OrderedDict)  # key is image index, value is {query: distortion}
         self.correct_all = torch.zeros_like(self.query_all)  # number of images
         self.not_done_all = torch.zeros_like(self.query_all)  # always set to 0 if the original image is misclassified
@@ -49,256 +70,413 @@ class Evolutionary(object):
         self.success_query_all = torch.zeros_like(self.query_all)
         self.distortion_with_max_queries_all = torch.zeros_like(self.query_all)
 
+    # We directly randomly select an image from corresponding dataset, and then querying the target model verify it.
+    def get_image_of_target_class(self, dataset_name, target_labels, target_model):
 
+        images = []
+        for label in target_labels:  # length of target_labels is 1
+            if dataset_name == "ImageNet":
+                dataset = ImageNetDataset(IMAGE_DATA_ROOT[dataset_name], label.item(), "validation")
+            elif dataset_name == "CIFAR-10":
+                dataset = CIFAR10Dataset(IMAGE_DATA_ROOT[dataset_name], label.item(), "validation")
+            elif dataset_name == "CIFAR-100":
+                dataset = CIFAR100Dataset(IMAGE_DATA_ROOT[dataset_name], label.item(), "validation")
+            elif dataset_name == "TinyImageNet":
+                dataset = TinyImageNetDataset(IMAGE_DATA_ROOT[dataset_name], label.item(), "validation")
+            index = np.random.randint(0, len(dataset))
+            image, true_label = dataset[index]
+            image = image.unsqueeze(0)
+            if dataset_name == "ImageNet" and target_model.input_size[-1] != 299:
+                image = F.interpolate(image,
+                                      size=(target_model.input_size[-2], target_model.input_size[-1]), mode='bilinear',
+                                      align_corners=False)
+            with torch.no_grad():
+                logits = target_model(image.cuda())
+            max_recursive_loop_limit = 100
+            loop_count = 0
+            while logits.max(1)[1].item() != label.item() and loop_count < max_recursive_loop_limit:
+                loop_count += 1
+                index = np.random.randint(0, len(dataset))
+                image, true_label = dataset[index]
+                image = image.unsqueeze(0)
+                if dataset_name == "ImageNet" and target_model.input_size[-1] != 299:
+                    image = F.interpolate(image,
+                                          size=(target_model.input_size[-2], target_model.input_size[-1]), mode='bilinear',
+                                          align_corners=False)
+                with torch.no_grad():
+                    logits = target_model(image.cuda())
 
+            if loop_count == max_recursive_loop_limit:
+                # The program cannot find a valid image from the validation set.
+                return None
 
-    def split_trunks(self, xs, n):
-        N = len(xs)
-        trunks = []
-        trunk_size = N // n
-        if N % n == 0:
-            for rank in range(n):
-                start = rank * trunk_size
-                trunks.append(xs[start:start + trunk_size])
+            assert true_label == label.item()
+            images.append(torch.squeeze(image))
+        return torch.stack(images)  # B,C,H,W
+
+    def decision_function(self, images, true_labels, target_labels):
+        images = torch.clamp(images, min=self.clip_min, max=self.clip_max).cuda()
+        logits = self.model(images)
+        if target_labels is None:
+            return logits.max(1)[1].detach().cpu().item() != true_labels[0].item()
         else:
-            for rank in range(N % n):
-                start = rank * (trunk_size + 1)
-                trunks.append(xs[start:start + trunk_size + 1])
-            for rank in range(N % n, n):
-                start = rank * trunk_size + (N % n)
-                trunks.append(xs[start:start + trunk_size])
-        return trunks
+            return logits.max(1)[1].detach().cpu().item() == target_labels[0].item()
 
-    def config(self, **kwargs):
-        ''' (Re)config the attack.
-        :param starting_points: Starting points which are already adversarial. A numpy array with data type of
-            ``self.x_dtype``, with shape of ``(self.batch_size, *self.x_shape)``.
-        :param max_queries: Max queries. An integer.
-        :param mu: A hyper-parameter controlling the mean of the Gaussian distribution. A float number.
-        :param sigma: A hyper-parameter controlling the variance of the Gaussian distribution. A float number.
-        :param decay_factor: The decay factor for the evolution path. A float number.
-        :param c: The decay factor for the covariance matrix. A float number.
-        :param maxprocs: Max number of processes to run MPI tasks. An Integer.
-        :param logger: A standard logger for logging verbose information during attacking.
-        '''
-        if 'starting_points' in kwargs:
-            self.starting_points = kwargs['starting_points']
+    def initialize(self, sample, target_images, true_labels, target_labels):
+        """
+        sample: the shape of sample is [C,H,W] without batch-size
+        Efficient Implementation of BlendedUniformNoiseAttack in Foolbox.
+        """
+        num_eval = 0
+        if target_images is None:
+            while True:
+                random_noise = torch.from_numpy(np.random.uniform(self.clip_min, self.clip_max, size=self.shape)).float()
+                # random_noise = torch.FloatTensor(*self.shape).uniform_(self.clip_min, self.clip_max)
+                success = self.decision_function(random_noise[None], true_labels, target_labels)
+                num_eval += 1
+                if success:
+                    break
+                if num_eval > 1000:
+                    log.info("Initialization failed! Use a misclassified image as `target_image")
+                    if target_labels is None:
+                        target_labels = torch.randint(low=0, high=CLASS_NUM[self.dataset_name],
+                                                      size=true_labels.size()).long()
+                        invalid_target_index = target_labels.eq(true_labels)
+                        while invalid_target_index.sum().item() > 0:
+                            target_labels[invalid_target_index] = torch.randint(low=0, high=CLASS_NUM[self.dataset_name],
+                                                                size=target_labels[invalid_target_index].size()).long()
+                            invalid_target_index = target_labels.eq(true_labels)
 
-        if 'max_queries' in kwargs:
-            self.max_queries = kwargs['max_queries']
-
-        if 'mu' in kwargs:
-            self.mu = kwargs['mu']
-        if 'sigma' in kwargs:
-            self.sigma = kwargs['sigma']
-        if 'decay_factor' in kwargs:
-            self.decay_factor = kwargs['decay_factor']
-        if 'c' in kwargs:
-            self.c = kwargs['c']
-
-        if 'maxprocs' in kwargs:
-            self.maxprocs = kwargs['maxprocs']
-
-        if 'logger' in kwargs:
-            self.logger = kwargs['logger']
-
-    def _batch_attack_generator(self, xs, ys, ys_target):
-        ''' Attack a batch of examples. It is a generator which yields back ``iteration_callback()``'s return value
-        after each iteration (query) if the ``iteration_callback`` is not ``None``, and returns the adversarial
-        examples.
-        '''
-        if self.iteration_callback is not None:
-            self._session.run(self.setup_xs_var, feed_dict={self.xs_ph: xs})
-        # use named memmap to speed up IPC
-        xs_shm_file = tempfile.NamedTemporaryFile(prefix='/dev/shm/realsafe_evolutionary_')
-        xs_adv_shm_file = tempfile.NamedTemporaryFile(prefix='/dev/shm/realsafe_evolutionary_xs_adv_')
-        xs_shm = np.memmap(xs_shm_file.name, dtype=self.model.x_dtype.as_numpy_dtype, mode='w+',
-                           shape=(self.batch_size, *self.model.x_shape))
-        xs_adv_shm = np.memmap(xs_adv_shm_file.name, dtype=self.model.x_dtype.as_numpy_dtype, mode='w+',
-                               shape=(self.batch_size, *self.model.x_shape))
-
-        # use a proper number of processes
-        nprocs = self.batch_size if self.batch_size <= self.maxprocs else self.maxprocs
-        # since we use memmap here, run everything on localhost
-        info = MPI.Info.Create()
-        info.Set("host", "localhost")
-        # spawn workers
-        worker = os.path.abspath(os.path.join(os.path.dirname(__file__), './evolutionary_worker.py'))
-        comm = MPI.COMM_SELF.Spawn(sys.executable, maxprocs=nprocs, info=info,
-                                   args=[worker, xs_shm_file.name, xs_adv_shm_file.name, str(self.batch_size)])
-        # prepare shared arguments
-        shared_args = {
-            'x_dtype': self.model.x_dtype.as_numpy_dtype,  # avoid importing tensorflow in workers
-            'x_shape': self.model.x_shape,
-            'x_min': float(self.model.x_min),
-            'x_max': float(self.model.x_max),
-            'mu': float(self.mu),
-            'sigma': float(self.sigma),
-            'decay_factor': float(self.decay_factor),
-            'c': float(self.c),
-            'goal': self.goal,
-            'dimension_reduction': self.dimension_reduction,
-        }
-        # prepare tasks
-        all_tasks = []
-        for i in range(self.batch_size):
-            all_tasks.append({
-                'index': i,
-                'x': xs[i],
-                'starting_point': self.starting_points[i],
-                'y': None if ys is None else ys[i],
-                'y_target': None if ys_target is None else ys_target[i],
-            })
-        # split tasks into trunks for each worker
-        trunks = self.split_trunks(all_tasks, nprocs)
-        # send arguments to workers
-        comm.bcast(shared_args, root=MPI.ROOT)
-        comm.scatter(trunks, root=MPI.ROOT)
-
-        # the main loop
-        for q in range(self.max_queries + 1):  # the first query is used to check the original examples
-            # collect log from workers
-            reqs = comm.gather(None, root=MPI.ROOT)
-            if self.logger:
-                for logs in reqs:
-                    for log in logs:
-                        self.logger.info(log)
-            # yield back iteration_callback return value
-            if self.iteration_callback is not None and q >= 1:
-                yield self._session.run(self.iteration_callback, feed_dict={self.xs_ph: xs_adv_shm})
-            if q == self.max_queries:
-                # send a None to all workers, so that they could exit
-                comm.scatter([None for _ in range(nprocs)], root=MPI.ROOT)
-                reqs = comm.gather(None, root=MPI.ROOT)
-                if self.logger:
-                    for logs in reqs:
-                        for log in logs:
-                            self.logger.info(log)
-            else:  # run predictions for xs_shm
-                xs_ph_labels = self._session.run(self.xs_ph_labels, feed_dict={self.xs_ph: xs_shm})
-                xs_ph_labels = xs_ph_labels.tolist()  # avoid pickle overhead of numpy array
-                comm.scatter(self.split_trunks(xs_ph_labels, nprocs), root=MPI.ROOT)  # send predictions to workers
-        # disconnect from MPI Spawn
-        comm.Disconnect()
-        # copy the xs_adv
-        xs_adv = xs_adv_shm.copy()
-
-        # delete the temp file
-        xs_shm_file.close()
-        xs_adv_shm_file.close()
-        del xs_shm
-        del xs_adv_shm
-
-        return xs_adv
-
-    def batch_attack(self, xs, ys=None, ys_target=None):
-        ''' Attack a batch of examples.
-        :return: When the ``iteration_callback`` is ``None``, return the generated adversarial examples. When the
-            ``iteration_callback`` is not ``None``, return a generator, which yields back the callback's return value
-            after each iteration and returns the generated adversarial examples.
-        '''
-        g = self._batch_attack_generator(xs, ys, ys_target)
-        if self.iteration_callback is None:
-            try:
-                next(g)
-            except StopIteration as exp:
-                return exp.value
+                    initialization = self.get_image_of_target_class(self.dataset_name,target_labels, self.model).squeeze()
+                    return initialization, 1
+                # assert num_eval < 1e4, "Initialization failed! Use a misclassified image as `target_image`"
+            # Binary search to minimize l2 distance to original image.
+            low = 0.0
+            high = 1.0
+            while high - low > 0.001:
+                mid = (high + low) / 2.0
+                blended = (1 - mid) * sample + mid * random_noise
+                success = self.decision_function(blended, true_labels, target_labels)
+                num_eval += 1
+                if success:
+                    high = mid
+                else:
+                    low = mid
+            # Sometimes, the found `high` is so tiny that the difference between initialization and sample is very
+            # small, this case will cause an infinity loop
+            initialization = (1 - high) * sample + high * random_noise
         else:
-            return g
+            initialization = target_images
+        return initialization, num_eval
 
-    def attack(self, index, x, starting_point, y, y_target,
-               x_dtype, x_shape, x_min, x_max,
-               mu, sigma, decay_factor, c, dimension_reduction,
-               logs, xs_adv_shm):
-
-        def fn_is_adversarial(label):
-            if not self.targeted:
-                return label != y
-            else:
-                return label == y_target
-
-        def fn_mean_square_distance(x1, x2):
-            return np.mean((x1 - x2) ** 2) / ((x_max - x_min) ** 2)
-
-        x_label = yield x
-        if fn_is_adversarial(x_label):
-            log.info('{}: The original image is already adversarial'.format(index))
-            xs_adv_shm[index] = x
-            return
-
-        xs_adv_shm[index] = starting_point
-        x_adv = starting_point
-        dist = fn_mean_square_distance(x, x_adv)
-        stats_adversarial = deque(maxlen=30)
-
-        if dimension_reduction:
-            assert len(x_shape) == 3
-            pert_shape = (*dimension_reduction, x_shape[2])
+    def _is_adversarial(self, x, y, ytarget):
+        output = torch.argmax(self.model(x), dim=1)
+        if ytarget is not None:
+            return output == ytarget
         else:
-            pert_shape = x_shape
+            return output != y
 
-        N = np.prod(pert_shape)
-        K = int(N / 20)
+    def attack(self, batch_index, images, target_images, true_labels, target_labels):
+        query = torch.zeros_like(true_labels).float()
+        success_stop_queries = query.clone()  # stop query count once the distortion < epsilon
+        batch_image_positions = np.arange(batch_index * self.batch_size,
+                                          min((batch_index + 1)*self.batch_size, self.total_images)).tolist()
+        batch_size = images.size(0)
 
-        evolution_path = np.zeros(pert_shape, dtype=x_dtype)
-        diagonal_covariance = np.ones(pert_shape, dtype=x_dtype)
+        x = images.cuda()
+        y = true_labels.cuda()
+        if target_labels is not None:
+            target_labels = target_labels.cuda()
+        pert_shape = (x.size(0), x.size(1), x.size(2), x.size(3))
+        m = np.prod(pert_shape)
+        k = int(m / 20)
+        evolutionary_path = np.zeros(pert_shape)
+        decay_weight = self.decay_weight
+        diagonal_covariance = np.ones(pert_shape)
+        ccov = self.ccov
+        # if self._is_adversarial(x, y, target_labels):
+        #     return x
 
-        x_adv_label = yield x_adv
+        # find an starting point
+        # x_adv = self.get_init_noise(x, y, ytarget)
+        x_adv, num_eval = self.initialize(images, target_images, true_labels, target_labels)
+        # log.info("after initialize")
+        query += num_eval
+        dist = torch.norm((x_adv - images).view(batch_size, -1), self.ord, 1)
+        working_ind = torch.nonzero(dist > self.epsilon).view(-1)  # get locations (i.e., indexes) of non-zero elements of an array.
+        success_stop_queries[working_ind] = query[working_ind]  # success times
 
-        log.info('{}: step {}, {:.5e}, prediction={}, stepsizes={:.1e}/{:.1e}: {}'.format(
-            index, 0, dist, x_adv_label, sigma, mu, ''
-        ))
+        for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
+            self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[inside_batch_index].item()
 
-        step = 0
-        while True:
-            step += 1
+        x_adv = x_adv.cuda()
+        mindist = 1e10
+        stats_adversarial = []
+        for _ in range(self.max_queries):
             unnormalized_source_direction = x - x_adv
-            source_norm = np.linalg.norm(unnormalized_source_direction)
+            source_norm = torch.norm(unnormalized_source_direction)
+            if mindist > source_norm:
+                mindist = source_norm
+                best_adv = x_adv
 
-            selection_probability = diagonal_covariance.reshape(-1) / np.sum(diagonal_covariance)
-            selected_indices = np.random.choice(N, K, replace=False, p=selection_probability)
+            selection_prob = diagonal_covariance.reshape(-1) / np.sum(diagonal_covariance)
+            selection_indices = np.random.choice(m, k, replace=False, p=selection_prob)
+            pert = np.random.normal(0.0, 1.0, pert_shape)
+            factor = np.zeros([m])
+            factor[selection_indices] = True
+            pert *= factor.reshape(pert_shape) * np.sqrt(diagonal_covariance)
+            pert_large = torch.Tensor(pert).cuda()
 
-            perturbation = np.random.normal(0.0, 1.0, pert_shape).astype(x_dtype)
-            factor = np.zeros([N], dtype=x_dtype)
-            factor[selected_indices] = 1
-            perturbation *= factor.reshape(pert_shape) * np.sqrt(diagonal_covariance)
+            biased = (x_adv + self.mu * unnormalized_source_direction).cuda()
+            candidate = biased + self.sigma * source_norm * pert_large / torch.norm(pert_large)
+            candidate = x - (x - candidate) / torch.norm(x - candidate) * torch.norm(x - biased)
+            candidate = torch.clamp(candidate, self.min_value, self.max_value)
 
-            if dimension_reduction:
-                perturbation_large = cv2.resize(perturbation, x_shape[:2])
+            if self._is_adversarial(candidate, y, target_labels):
+                x_adv = candidate
+                evolutionary_path = decay_weight * evolutionary_path + np.sqrt(1 - decay_weight ** 2) * pert
+                diagonal_covariance = (1 - ccov) * diagonal_covariance + ccov * (evolutionary_path ** 2)
+                stats_adversarial.append(1)
+
+                dist = torch.norm((x_adv - x).view(batch_size, -1), self.ord, 1)
+                working_ind = torch.nonzero(dist > self.epsilon).view(-1)
+                success_stop_queries[working_ind] = query[working_ind]
+                for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
+                    self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[
+                        inside_batch_index].item()
+                log.info('{}-th image, {}: distortion {:.4f}, query: {}'.format(batch_index+1, self.norm, dist.item(), int(query[0].item())))
             else:
-                perturbation_large = perturbation
+                stats_adversarial.append(0)
+            query += 1
+            if len(stats_adversarial) == self.maxlen:
+                self.mu *= np.exp(np.mean(stats_adversarial) - 0.2)
+                stats_adversarial = []
 
-            biased = x_adv + mu * unnormalized_source_direction
-            candidate = biased + sigma * source_norm * perturbation_large / np.linalg.norm(perturbation_large)
-            candidate = x - (x - candidate) / np.linalg.norm(x - candidate) * np.linalg.norm(x - biased)
-            candidate = np.clip(candidate, x_min, x_max)
+            if torch.sum(query >= self.maximum_queries).item() == true_labels.size(0):
+                break
+            # compute new distance.
+            # dist = torch.norm((x_adv - x).view(batch_size, -1), self.ord, 1)
+            # log.info('{}-th image, {}: distortion {:.4f}, query: {}'.format(batch_index + 1,
+            #                                                                 self.norm, dist.item(),
+            #                                                                 int(query[0].item())))
+            if dist.item() < 1e-4:  # 发现攻击jpeg时候卡住，故意加上这句话
+                break
+        success_stop_queries = torch.clamp(success_stop_queries, 0, self.maximum_queries)
 
-            candidate_label = yield candidate
+        return x_adv, query, success_stop_queries, dist, (dist <= self.epsilon)
 
-            is_adversarial = fn_is_adversarial(candidate_label)
-            stats_adversarial.appendleft(is_adversarial)
+    def attack_all_images(self, args, arch_name, result_dump_path):
+        if args.targeted and args.target_type == "load_random":
+            loaded_target_labels = np.load("./target_class_labels/{}/label.npy".format(args.dataset))
+            loaded_target_labels = torch.from_numpy(loaded_target_labels).long()
+        for batch_index, (images, true_labels) in enumerate(self.dataset_loader):
+            if args.dataset == "ImageNet" and self.model.input_size[-1] != 299:
+                images = F.interpolate(images,
+                                       size=(self.model.input_size[-2], self.model.input_size[-1]), mode='bilinear',
+                                       align_corners=False)
+            with torch.no_grad():
+                logit = self.model(images.cuda())
+            pred = logit.argmax(dim=1)
+            correct = pred.eq(true_labels.cuda()).float()  # shape = (batch_size,)
+            if correct.int().item() == 0: # we must skip any image that is classified incorrectly before attacking, otherwise this will cause infinity loop in later procedure
+                log.info("{}-th original image is classified incorrectly, skip!".format(batch_index+1))
+                continue
+            selected = torch.arange(batch_index * args.batch_size, min((batch_index + 1) * args.batch_size, self.total_images))
+            if args.targeted:
+                if args.target_type == 'random':
+                    target_labels = torch.randint(low=0, high=CLASS_NUM[args.dataset],
+                                                  size=true_labels.size()).long()
+                    invalid_target_index = target_labels.eq(true_labels)
+                    while invalid_target_index.sum().item() > 0:
+                        target_labels[invalid_target_index] = torch.randint(low=0, high=logit.shape[1],
+                                                                            size=target_labels[invalid_target_index].shape).long()
+                        invalid_target_index = target_labels.eq(true_labels)
+                elif args.target_type == "load_random":
+                    target_labels = loaded_target_labels[selected]
+                    assert target_labels[0].item()!=true_labels[0].item()
+                    # log.info("load random label as {}".format(target_labels))
+                elif args.target_type == 'least_likely':
+                    target_labels = logit.argmin(dim=1).detach().cpu()
+                elif args.target_type == "increment":
+                    target_labels = torch.fmod(true_labels + 1, CLASS_NUM[args.dataset])
+                else:
+                    raise NotImplementedError('Unknown target_type: {}'.format(args.target_type))
 
-            if is_adversarial:
-                xs_adv_shm[index] = candidate
-                new_x_adv = candidate
-                new_dist = fn_mean_square_distance(new_x_adv, x)
-                evolution_path = decay_factor * evolution_path + np.sqrt(1 - decay_factor ** 2) * perturbation
-                diagonal_covariance = (1 - c) * diagonal_covariance + c * (evolution_path ** 2)
+                target_images = self.get_image_of_target_class(self.dataset_name, target_labels, self.model)
+                if target_images is None:
+                    log.info("{}-th image cannot get a valid target class image to initialize!".format(batch_index+1))
+                    continue
             else:
-                new_x_adv = None
+                target_labels = None
+                target_images = None
 
-            message = ''
-            if new_x_adv is not None:
-                abs_improvement = dist - new_dist
-                rel_improvement = abs_improvement / dist
-                message = 'd. reduced by {:.2f}% ({:.4e})'.format(rel_improvement * 100, abs_improvement)
-                x_adv, dist = new_x_adv, new_dist
-                x_adv_label = candidate_label
+            adv_images, query, success_query, distortion_with_max_queries, success_epsilon = self.attack(batch_index, images, target_images, true_labels, target_labels)
+            distortion_with_max_queries = distortion_with_max_queries.detach().cpu()
+            with torch.no_grad():
+                if adv_images.dim() == 3:
+                    adv_images = adv_images.unsqueeze(0)
+                adv_logit = self.model(adv_images.cuda())
+            adv_pred = adv_logit.argmax(dim=1)
+            ## Continue query count
+            not_done = correct.clone()
+            if args.targeted:
+                not_done = not_done * (1 - adv_pred.eq(target_labels.cuda()).float()).float()  # not_done初始化为 correct, shape = (batch_size,)
+            else:
+                not_done = not_done * adv_pred.eq(true_labels.cuda()).float()  #
+            success = (1 - not_done.detach().cpu()) * correct.detach().cpu() * success_epsilon.detach().cpu() * (
+                        success_query.detach().cpu() <= self.maximum_queries).float()
 
-            log.info('{}: step {}, {:.5e}, prediction={}, stepsizes={:.1e}/{:.1e}: {}'.format(
-                index, step, dist, x_adv_label, sigma, mu, message))
+            for key in ['query', 'correct', 'not_done',
+                        'success', 'success_query', "distortion_with_max_queries"]:
+                value_all = getattr(self, key + "_all")
+                value = eval(key)
+                value_all[selected] = value.detach().float().cpu()
 
-            if len(stats_adversarial) == stats_adversarial.maxlen:
-                p_step = np.mean(stats_adversarial)
-                mu *= np.exp(p_step - 0.2)
-                stats_adversarial.clear()
+        log.info('{} is attacked finished ({} images)'.format(arch_name, self.total_images))
+        log.info('Saving results to {}'.format(result_dump_path))
+        meta_info_dict = {"avg_correct": self.correct_all.mean().item(),
+                          "avg_not_done": self.not_done_all[self.correct_all.bool()].mean().item(),
+                          "mean_query": self.success_query_all[self.success_all.bool()].mean().item() if self.success_all.sum().item() > 0 else 0,
+                          "median_query": self.success_query_all[self.success_all.bool()].median().item() if self.success_all.sum().item() > 0 else 0,
+                          "max_query": self.success_query_all[self.success_all.bool()].max().item() if self.success_all.sum().item() > 0 else 0,
+                          "correct_all": self.correct_all.detach().cpu().numpy().astype(np.int32).tolist(),
+                          "not_done_all": self.not_done_all.detach().cpu().numpy().astype(np.int32).tolist(),
+                          "success_all":self.success_all.detach().cpu().numpy().astype(np.int32).tolist(),
+                          "query_all": self.query_all.detach().cpu().numpy().astype(np.int32).tolist(),
+                          "success_query_all": self.success_query_all.detach().cpu().numpy().astype(np.int32).tolist(),
+                          "distortion": self.distortion_all,
+                          "avg_distortion_with_max_queries": self.distortion_with_max_queries_all.mean().item(),
+                          "args": vars(args)}
+        with open(result_dump_path, "w") as result_file_obj:
+            json.dump(meta_info_dict, result_file_obj, sort_keys=True)
+        log.info("done, write stats info to {}".format(result_dump_path))
+
+
+def get_exp_dir_name(dataset,  norm, targeted, target_type, args):
+    if target_type == "load_random":
+        target_type = "random"
+    target_str = "untargeted" if not targeted else "targeted_{}".format(target_type)
+    if args.attack_defense:
+        dirname = 'Evolutionary_on_defensive_model-{}-{}-{}'.format(dataset, norm, target_str)
+    else:
+        dirname = 'Evolutionary-{}-{}-{}'.format(dataset, norm, target_str)
+    return dirname
+
+def print_args(args):
+    keys = sorted(vars(args).keys())
+    max_len = max([len(key) for key in keys])
+    for key in keys:
+        prefix = ' ' * (max_len + 1 - len(key)) + key
+        log.info('{:s}: {}'.format(prefix, args.__getattribute__(key)))
+
+def set_log_file(fname):
+    import subprocess
+    tee = subprocess.Popen(['tee', fname], stdin=subprocess.PIPE)
+    os.dup2(tee.stdin.fileno(), sys.stdout.fileno())
+    os.dup2(tee.stdin.fileno(), sys.stderr.fileno())
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu",type=int, required=True)
+    parser.add_argument('--json-config', type=str, default='./configures/Evolutionary.json',
+                        help='a configures file to be passed in instead of arguments')
+    parser.add_argument('--epsilon', type=float, help='the lp perturbation bound')
+    parser.add_argument("--norm",type=str, choices=["l2","linf"],required=True)
+    parser.add_argument('--batch-size', type=int, default=1, help='batch size must set to 1')
+    parser.add_argument('--dataset', type=str, required=True,
+               choices=['CIFAR-10', 'CIFAR-100', 'ImageNet', "FashionMNIST", "MNIST", "TinyImageNet"], help='which dataset to use')
+    parser.add_argument('--arch', default=None, type=str, help='network architecture')
+    parser.add_argument('--all-archs', action="store_true")
+    parser.add_argument('--targeted', action="store_true")
+    parser.add_argument('--target-type',type=str, default='increment', choices=['random', "load_random", 'least_likely',"increment"])
+    parser.add_argument('--exp-dir', default='logs', type=str, help='directory to save results and logs')
+    parser.add_argument('--seed', default=0, type=int, help='random seed')
+    parser.add_argument('--attack-defense',action="store_true")
+    parser.add_argument('--defense-model',type=str, default=None)
+    parser.add_argument('--defense-norm',type=str,choices=["l2","linf"],default='linf')
+    parser.add_argument('--defense-eps',type=str,default="")
+    parser.add_argument('--k', type=int, help='the key parameter that influences the results of untargeted and targeted attacks')
+    parser.add_argument('--max-queries',type=int, default=10000)
+
+    args = parser.parse_args()
+    assert args.batch_size == 1, "Evolutionary Attack only supports mini-batch size equals 1!"
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+    args_dict = None
+    if not args.json_config:
+        # If there is no json file, all of the args must be given
+        args_dict = vars(args)
+    else:
+        # If a json file is given, use the JSON file as the base, and then update it with args
+        defaults = json.load(open(args.json_config))[args.dataset][args.norm]
+        arg_vars = vars(args)
+        arg_vars = {k: arg_vars[k] for k in arg_vars if arg_vars[k] is not None}
+        defaults.update(arg_vars)
+        args = SimpleNamespace(**defaults)
+        args_dict = defaults
+    if args.targeted:
+        if args.dataset == "ImageNet":
+            args.max_queries = 20000
+    if args.attack_defense and args.defense_model == "adv_train_on_ImageNet":
+        args.max_queries = 20000
+    args.exp_dir = osp.join(args.exp_dir,
+                            get_exp_dir_name(args.dataset, args.norm, args.targeted, args.target_type, args))
+    os.makedirs(args.exp_dir, exist_ok=True)
+
+    if args.all_archs:
+        if args.attack_defense:
+            log_file_path = osp.join(args.exp_dir, 'run_defense_{}.log'.format(args.defense_model))
+        else:
+            log_file_path = osp.join(args.exp_dir, 'run.log')
+    elif args.arch is not None:
+        if args.attack_defense:
+            if args.defense_model == "adv_train_on_ImageNet":
+                log_file_path = osp.join(args.exp_dir,
+                                         "run_defense_{}_{}_{}_{}.log".format(args.arch, args.defense_model,
+                                                                              args.defense_norm,
+                                                                              args.defense_eps))
+            else:
+                log_file_path = osp.join(args.exp_dir, 'run_defense_{}_{}.log'.format(args.arch, args.defense_model))
+        else:
+            log_file_path = osp.join(args.exp_dir, 'run_{}.log'.format(args.arch))
+    set_log_file(log_file_path)
+    if args.attack_defense:
+        assert args.defense_model is not None
+
+    torch.backends.cudnn.deterministic = True
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.all_archs:
+        archs = MODELS_TEST_STANDARD[args.dataset]
+    else:
+        assert args.arch is not None
+        archs = [args.arch]
+    args.arch = ", ".join(archs)
+    log.info('Command line is: {}'.format(' '.join(sys.argv)))
+    log.info("Log file is written in {}".format(log_file_path))
+    log.info('Called with args:')
+    print_args(args)
+    for arch in archs:
+        if args.attack_defense:
+            if args.defense_model == "adv_train_on_ImageNet":
+                save_result_path = args.exp_dir + "/{}_{}_{}_{}_result.json".format(arch, args.defense_model,
+                                                                                    args.defense_norm,args.defense_eps)
+            else:
+                save_result_path = args.exp_dir + "/{}_{}_result.json".format(arch, args.defense_model)
+        else:
+            save_result_path = args.exp_dir + "/{}_result.json".format(arch)
+        if os.path.exists(save_result_path):
+            continue
+        log.info("Begin attack {} on {}, result will be saved to {}".format(arch, args.dataset, save_result_path))
+        if args.attack_defense:
+            model = DefensiveModel(args.dataset, arch, no_grad=True, defense_model=args.defense_model,
+                                   norm=args.defense_norm, eps=args.defense_eps)
+        else:
+            model = StandardModel(args.dataset, arch, no_grad=True)
+        model.cuda()
+        model.eval()
+        attacker = Evolutionary(model, args.dataset, 0, 1.0, model.input_size[-2], model.input_size[-1], IN_CHANNELS[args.dataset],
+                                args.norm, args.epsilon, maximum_queries=args.max_queries, batch_size=args.batch_size)
+        attacker.attack_all_images(args, arch, save_result_path)
+        model.cpu()

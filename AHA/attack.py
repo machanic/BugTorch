@@ -13,62 +13,38 @@ import torch
 import numpy as np
 import glog as log
 from torch.nn import functional as F
-from config import CLASS_NUM, MODELS_TEST_STANDARD, IN_CHANNELS, IMAGE_DATA_ROOT
+from config import CLASS_NUM, MODELS_TEST_STANDARD, IMAGE_SIZE, IMAGE_DATA_ROOT, IN_CHANNELS
 from dataset.dataset_loader_maker import DataLoaderMaker
 from models.standard_model import StandardModel
 from models.defensive_model import DefensiveModel
 from dataset.target_class_dataset import ImageNetDataset,CIFAR100Dataset,CIFAR10Dataset,TinyImageNetDataset
+from PIL import Image
+from scipy.fftpack import dct, idct
 
-class HopSkipJumpAttack(object):
-    def __init__(self, model, dataset,  clip_min, clip_max, height, width, channels, norm, epsilon,
-                 iterations=40, gamma=1.0,
-                 stepsize_search='geometric_progression',
-                 max_num_evals=1e4, init_num_evals=100,maximum_queries=10000,batch_size=1,random_direction=False):
-        """
-        :param clip_min: lower bound of the image.
-        :param clip_max: upper bound of the image.
-        :param norm: choose between [l2, linf].
-        :param iterations: number of iterations.
-        :param gamma: used to set binary search threshold theta. The binary search
-                     threshold theta is gamma / d^{3/2} for l2 attack and gamma / d^2 for linf attack.
-        :param stepsize_search: choose between 'geometric_progression', 'grid_search'.
-        :param max_num_evals: maximum number of evaluations for estimating gradient.
-        :param init_num_evals: initial number of evaluations for estimating gradient.
-        """
+class AHA(object):
+    def __init__(self, model, dataset,  clip_min, clip_max, height, width, channels, batch_size, norm, epsilon,
+                 maximum_queries=10000):
         self.model = model
         self.norm = norm
         self.ord = np.inf if self.norm == "linf" else 2
         self.epsilon = epsilon
         self.clip_min = clip_min
         self.clip_max = clip_max
-        self.dim = height * width * channels
-        self.height = height
-        self.width = width
-        self.channels = channels
         self.shape = (channels, height, width)
-        if self.norm == "l2":
-            self.theta = gamma / (np.sqrt(self.dim) * self.dim)
-        else:
-            self.theta = gamma / (self.dim ** 2)
-        self.init_num_evals = init_num_evals
-        self.max_num_evals = max_num_evals
-        self.num_iterations = iterations
-        self.gamma = gamma
-        self.stepsize_search = stepsize_search
 
         self.maximum_queries = maximum_queries
         self.dataset_name = dataset
         self.dataset_loader = DataLoaderMaker.get_test_attacked_data(dataset, batch_size)
         self.batch_size = batch_size
         self.total_images = len(self.dataset_loader.dataset)
-        self.query_all = torch.zeros(self.total_images)
+        self.query_all = torch.zeros(self.total_images) # 查询次数
         self.distortion_all = defaultdict(OrderedDict)  # key is image index, value is {query: distortion}
         self.correct_all = torch.zeros_like(self.query_all)  # number of images
         self.not_done_all = torch.zeros_like(self.query_all)  # always set to 0 if the original image is misclassified
         self.success_all = torch.zeros_like(self.query_all)
         self.success_query_all = torch.zeros_like(self.query_all)
         self.distortion_with_max_queries_all = torch.zeros_like(self.query_all)
-        self.random_direction = random_direction
+        # self.random_direction = random_direction
 
     def get_image_of_target_class(self, dataset_name, target_labels, target_model):
 
@@ -114,13 +90,12 @@ class HopSkipJumpAttack(object):
         return torch.stack(images)  # B,C,H,W
 
     def decision_function(self, images, true_labels, target_labels):
-        images = torch.clamp(images, min=self.clip_min, max=self.clip_max).cuda()
-        logits = self.model(images)
+        images = torch.clamp(images, min=self.clip_min, max=self.clip_max)
+        logits = self.model(images.cuda())
         if target_labels is None:
             return logits.max(1)[1].detach().cpu() != true_labels
         else:
             return logits.max(1)[1].detach().cpu() == target_labels
-
 
     def initialize(self, sample, target_images, true_labels, target_labels):
         """
@@ -147,7 +122,7 @@ class HopSkipJumpAttack(object):
                                                                 size=target_labels[invalid_target_index].size()).long()
                             invalid_target_index = target_labels.eq(true_labels)
 
-                    initialization = self.get_image_of_target_class(self.dataset_name,target_labels, self.model).squeeze()
+                    initialization = self.get_image_of_target_class(self.dataset_name, [target_labels], self.model).squeeze()
                     return initialization, 1
                 # assert num_eval < 1e4, "Initialization failed! Use a misclassified image as `target_image`"
             # Binary search to minimize l2 distance to original image.
@@ -156,7 +131,7 @@ class HopSkipJumpAttack(object):
             while high - low > 0.001:
                 mid = (high + low) / 2.0
                 blended = (1 - mid) * sample + mid * random_noise
-                success = self.decision_function(blended[None], true_labels, target_labels)[0].item()
+                success = self.decision_function(blended, true_labels, target_labels)[0].item()
                 num_eval += 1
                 if success:
                     high = mid
@@ -168,258 +143,170 @@ class HopSkipJumpAttack(object):
             initialization = target_images
         return initialization, num_eval
 
-    def clip_image(self, image, clip_min, clip_max):
-        # Clip an image, or an image batch, with upper and lower threshold.
-        return torch.min(torch.max(image, clip_min), clip_max)
+    def batch_initialize(self, samples, target_images, true_labels, target_labels):
+        initialization = samples.clone()
+        num_evals = torch.zeros_like(true_labels).float()
 
-    def project(self, original_image, perturbed_images, alphas):
-        alphas_shape = [alphas.size(0)] + [1] * len(self.shape)
-        alphas = alphas.view(*alphas_shape)
-        if self.norm == 'l2':
-            return (1 - alphas) * original_image + alphas * perturbed_images
-        elif self.norm == 'linf':
-            out_images = self.clip_image(perturbed_images, original_image - alphas, original_image + alphas)
-            return out_images
+        with torch.no_grad():
+            logit = self.model(samples.cuda())
+        pred = logit.argmax(dim=1)
+        correct = pred.eq(true_labels.cuda()).float()
+        for i in range(len(correct)):
+            if correct[i]:
+                if target_images is None:
+                    initialization[i], num_evals[i] = self.initialize(samples[i], None, true_labels[i], None)
+                else:
+                    initialization[i], num_evals[i] = self.initialize(samples[i], target_images[i], true_labels[i], target_labels[i])
 
-    def binary_search_batch(self, original_image, perturbed_images, true_labels, target_labels):
-        num_evals = 0
-        # Compute distance between each of perturbed image and original image.
-        dists_post_update = torch.tensor([
-            self.compute_distance(
-                original_image,
-                perturbed_image,
-                self.norm
-            ) for perturbed_image in perturbed_images])
-        # Choose upper thresholds in binary searchs based on constraint.
-        if self.norm == "linf":
-            highs = dists_post_update
-            # Stopping criteria.
-            thresholds = torch.clamp_max(dists_post_update * self.theta, max=self.theta)
-        else:
-            highs = torch.ones(perturbed_images.size(0))
-            thresholds = self.theta
-        lows = torch.zeros(perturbed_images.size(0))
-        # Call recursive function.
+        return initialization, num_evals
 
-        while torch.max((highs - lows) / thresholds).item() > 1:
-            # log.info("max in binary search func: {}, highs:{}, lows:{}, highs-lows: {} , threshold {}, (highs - lows) / thresholds: {}".format(torch.max((highs - lows) / thresholds).item(),highs, lows, highs-lows, thresholds, (highs - lows) / thresholds))
-            # projection to mids.
-            mids = (highs + lows) / 2.0
-            mid_images = self.project(original_image, perturbed_images, mids)
-            # Update highs and lows based on model decisions.
-            decisions = self.decision_function(mid_images, true_labels, target_labels)
-            num_evals += mid_images.size(0)
-            decisions = decisions.int()
-            lows = torch.where(decisions == 0, mids, lows)  # lows:攻击失败的用mids，攻击成功的用low
-            highs = torch.where(decisions == 1, mids, highs)  # highs: 攻击成功的用mids，攻击失败的用high, 不理解的可以去看论文Algorithm 1
-            # log.info("decision: {} low: {}, high: {}".format(decisions.detach().cpu().numpy(),lows.detach().cpu().numpy(), highs.detach().cpu().numpy()))
-        out_images = self.project(original_image, perturbed_images, highs)  # high表示classification boundary偏攻击成功一点的线
-        # Compute distance of the output image to select the best choice.
-        # (only used when stepsize_search is grid_search.)
-        dists = torch.tensor([
-            self.compute_distance(
-                original_image,
-                out_image,
-                self.norm
-            ) for out_image in out_images])
-        idx = torch.argmin(dists)
-        dist = dists_post_update[idx]
-        out_image = out_images[idx]
-        return out_image, dist, num_evals
+    def sample_gaussian_torch(self, image_size, dct_ratio=1.0):
+        x = torch.zeros(image_size)
+        fill_size = int(image_size[-1] * dct_ratio)
+        x[:, :, :fill_size, :fill_size] = torch.randn(x.size(0), x.size(1), fill_size, fill_size)
+        if dct_ratio < 1.0:
+            x = torch.from_numpy(idct(idct(x.cpu().numpy(), axis=3, norm='ortho'), axis=2, norm='ortho'))
+        return x.squeeze().contiguous()
 
-    def select_delta(self, cur_iter, dist_post_update):
-        """
-        Choose the delta at the scale of distance
-        between x and perturbed sample.
-
-        """
-        if cur_iter == 1:
-            delta = 0.1 * (self.clip_max - self.clip_min)
-        else:
-            if self.norm == 'l2':
-                delta = np.sqrt(self.dim) * self.theta * dist_post_update
-            elif self.norm == 'linf':
-                delta = self.dim * self.theta * dist_post_update
-        return delta
-
-    def approximate_gradient(self, sample, true_labels, target_labels, num_evals, delta):
-        clip_max, clip_min = self.clip_max, self.clip_min
-
-        # Generate random vectors.
-        noise_shape = [num_evals] + list(self.shape)
-        if self.norm == 'l2':
-            rv = torch.randn(*noise_shape)
-        elif self.norm == 'linf':
-            rv = torch.from_numpy(np.random.uniform(low=-1, high=1, size=noise_shape)).float()
-            # rv = torch.FloatTensor(*noise_shape).uniform_(-1, 1)
-        rv = rv / torch.sqrt(torch.sum(torch.mul(rv,rv), dim=(1,2,3),keepdim=True))
-        perturbed = sample + delta * rv
-        perturbed = torch.clamp(perturbed, clip_min, clip_max)
-        rv = (perturbed - sample) / delta
-
-        # query the model.
-        # if self.dataset_name=="ImageNet" and perturbed.size(0) >= 4:  # FIXME save GPU memory
-        #     decisions_1 = self.decision_function(perturbed[:perturbed.size(0)//4], true_labels, target_labels)
-        #     decisions_2 = self.decision_function(perturbed[perturbed.size(0) // 4: perturbed.size(0) * 2 // 4], true_labels, target_labels)
-        #     decisions_3 = self.decision_function(perturbed[perturbed.size(0)*2 // 4:perturbed.size(0) * 3 // 4],
-        #                                          true_labels, target_labels)
-        #     decisions_4 = self.decision_function(perturbed[perturbed.size(0) * 3 // 4:],
-        #                                          true_labels, target_labels)
-        #     decisions = torch.cat([decisions_1, decisions_2,decisions_3,decisions_4],0)
-        # else:
-        decisions = self.decision_function(perturbed, true_labels, target_labels)
-        decision_shape = [decisions.size(0)] + [1] * len(self.shape)
-        fval = 2 * decisions.float().view(decision_shape) - 1.0
-
-        # Baseline subtraction (when fval differs)
-        if torch.mean(fval).item() == 1.0:  # label changes.
-            gradf = torch.mean(rv, dim=0)
-        elif torch.mean(fval).item() == -1.0:  # label not change.
-            gradf = -torch.mean(rv, dim=0)
-        else:
-            fval -= torch.mean(fval)
-            gradf = torch.mean(fval * rv, dim=0)
-
-        # Get the gradient direction.
-        gradf = gradf / torch.norm(gradf,p=2)
-
-        return gradf
-
-    def geometric_progression_for_stepsize(self, x, true_labels, target_labels, update, dist, cur_iter):
-        """
-        Geometric progression to search for stepsize.
-        Keep decreasing stepsize by half until reaching
-        the desired side of the boundary,
-        """
-        epsilon = dist.item() / np.sqrt(cur_iter)
-        num_evals = np.zeros(1)
-        def phi(epsilon, num_evals):
-            new = x + epsilon * update
-            success = self.decision_function(new[None], true_labels,target_labels)
-            num_evals += 1
-            return bool(success[0].item())
-
-        while not phi(epsilon, num_evals):  # 只要没有成功，就缩小epsilon
-            epsilon /= 2.0
-        return epsilon, num_evals.item()
-
-    def compute_distance(self, x_ori, x_pert, norm='l2'):
-        # Compute the distance between two images.
-        if norm == 'l2':
-            return torch.norm(x_ori - x_pert,p=2).item()
-        elif norm == 'linf':
-            return torch.max(torch.abs(x_ori - x_pert)).item()
-
-
-
-    def attack(self, batch_index, images, target_images, true_labels, target_labels):
+    def attack(self, batch_index, images, target_images, true_labels, target_labels, image_size):
         query = torch.zeros_like(true_labels).float()
         success_stop_queries = query.clone()  # stop query count once the distortion < epsilon
         batch_image_positions = np.arange(batch_index * self.batch_size,
-                                          min((batch_index + 1)*self.batch_size, self.total_images)).tolist()
-        assert images.size(0) == 1
+                                          min((batch_index + 1) * self.batch_size, self.total_images)).tolist()
+
         batch_size = images.size(0)
-        images = images.squeeze()
         if target_images is not None:
             target_images = target_images.squeeze()
         # Initialize. Note that if the original image is already classified incorrectly, the difference between the found initialization and sample is very very small, this case will lead to inifinity loop later.
-        perturbed, num_eval = self.initialize(images, target_images, true_labels, target_labels)
-        # log.info("after initialize")
+        x_adv, num_eval = self.batch_initialize(images, target_images, true_labels, target_labels)
+        # if target_labels is None:
+        #     with torch.no_grad():
+        #         target_labels = self.model(x_adv.cuda()).max(1)[1].detach().cpu()
         query += num_eval
-        dist = torch.norm((perturbed - images).view(batch_size, -1), self.ord, 1)
+        dist = torch.norm((x_adv - images).view(batch_size, -1), self.ord, 1)
         working_ind = torch.nonzero(dist > self.epsilon).view(-1)
         success_stop_queries[working_ind] = query[working_ind]
         for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
-            self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[inside_batch_index].item()
+            self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[
+                inside_batch_index].item()
 
-        # Project the initialization to the boundary.
-        # log.info("before first binary_search_batch")
-        perturbed, dist_post_update, num_eval = self.binary_search_batch(images, perturbed[None], true_labels,target_labels)
-        # log.info("after first binary_search_batch")
-        dist =  torch.norm((perturbed - images).view(batch_size, -1), self.ord, 1)
-        working_ind = torch.nonzero(dist > self.epsilon).view(-1)
-        query += num_eval
-        success_stop_queries[working_ind] = query[working_ind]
+        alpha = 1e-2 * torch.ones(images.size(0))
+        beta = 1e-2
+        m = 1e-2
+        # stats_adversarial = []
+        # stats = [[] for ii in range(images.size(0))]
+        alphas = []
+        alphas.append(alpha)
+        muls = []
+        # labels = []
 
-        cur_iter = 0
-        for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
-            self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[inside_batch_index].item()
+        def get_norm(t):
+            return (t.view(t.size(0), -1) ** 2).sum(dim=1).sqrt()
 
-        # init variables
-        for j in range(self.num_iterations):
-            cur_iter += 1
-            # Choose delta.
-            delta = self.select_delta(cur_iter, dist_post_update)
+        def make_adv(adv):
+            return adv
 
-            # Choose number of evaluations.
-            num_evals = int(self.init_num_evals * np.sqrt(j+1))
-            num_evals = int(min([num_evals, self.max_num_evals]))
-            gradf = self.approximate_gradient(perturbed, true_labels, target_labels, num_evals, delta)
-            query += num_evals
-            if self.random_direction:
-                random_direction = torch.randn_like(images)
-                random_direction = random_direction/torch.linalg.norm(random_direction)
-                while torch.vdot(random_direction.view(-1), gradf.view(-1)).item()<0:
-                    random_direction = torch.randn_like(images)
-                    random_direction = random_direction / torch.linalg.norm(random_direction)
-                gradf = random_direction
-            if self.norm == "linf":
-                update = torch.sign(gradf)
+        def test(adv):
+            adv = make_adv(adv)
+            pred = self.model(adv.cuda())
+            if target_labels is None:
+                return (pred.max(1)[1].detach().cpu() != true_labels).float()
             else:
-                update = gradf
-            # search step size.
-            if self.stepsize_search == 'geometric_progression':
-                # find step size.
-                epsilon, num_evals = self.geometric_progression_for_stepsize(perturbed, true_labels, target_labels, update, dist, cur_iter)
-                query += num_evals
-                # Update the sample.
-                perturbed = torch.clamp(perturbed + epsilon * update, self.clip_min, self.clip_max)
-                # Binary search to return to the boundary.
-                # log.info("before geometric_progression binary_search_batch")
-                perturbed, dist_post_update, num_eval = self.binary_search_batch(images, perturbed[None], true_labels, target_labels)
-                # log.info("after geometric_progression binary_search_batch")
-                query += num_eval
-                dist =  torch.norm((perturbed - images).view(batch_size, -1), self.ord, 1)
-                working_ind = torch.nonzero(dist > self.epsilon).view(-1)
-                success_stop_queries[working_ind] = query[working_ind]
-                for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
-                    self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[
-                        inside_batch_index].item()
-            elif self.stepsize_search == "grid_search":
-                # Grid search for stepsize.
-                epsilons = torch.logspace(-4, 0, steps=20) * dist
-                epsilons_shape = [20] + len(self.shape) * [1]
-                perturbeds = perturbed + epsilons.view(epsilons_shape) * update
-                perturbeds = torch.clamp(perturbeds, self.clip_min, self.clip_max)
-                idx_perturbed = self.decision_function(perturbeds, true_labels, target_labels)
-                query += perturbeds.size(0)
-                for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
-                    self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[
-                        inside_batch_index].item()
-                if idx_perturbed.int().sum().item() > 0:
-                    # Select the perturbation that yields the minimum distance # after binary search.
-                    perturbed, dist_post_update, num_eval = self.binary_search_batch(images, perturbeds[idx_perturbed], true_labels, target_labels)
-                    query += num_eval
-                    dist = torch.norm((perturbed - images).view(batch_size, -1), self.ord, 1)
-                    working_ind = torch.nonzero(dist > self.epsilon).view(-1)
-                    success_stop_queries[working_ind] = query[working_ind]
-                    for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
-                        self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[
-                            inside_batch_index].item()
-            if torch.sum(query >= self.maximum_queries).item() == true_labels.size(0):
-                break
-            # compute new distance.
-            dist = torch.norm((perturbed - images).view(batch_size, -1), self.ord, 1)
-            log.info('{}-th image, iteration: {}, {}: distortion {:.4f}, query: {}'.format(batch_index+1, j + 1, self.norm, dist.item(), int(query[0].item())))
-            if dist.item() < 1e-4:  # 发现攻击jpeg时候卡住，故意加上这句话
-                break
+                return (pred.max(1)[1].detach().cpu() == target_labels).float()
+
+        def calc_norm(adv):
+            d = make_adv(adv) - images
+            return get_norm(d)
+
+        # def to_boundary(img):
+        #     high, low = img.clone(), images.clone()
+        #     num_evals = 0
+        #     while (high - low).abs().max() > 1e-5:
+        #         mid = (high + low) / 2
+        #         index = test(mid)
+        #         num_evals += 1
+        #         high[index == 1] = mid[index == 1]
+        #         low[index == 0] = mid[index == 0]
+        #     return high, num_evals
+
+        DIM = int(image_size / 4)
+
+        # x_adv, num_evals = to_boundary(x_adv)
+        dist = torch.norm((x_adv - images).view(batch_size, -1), self.ord, 1)
+        working_ind = torch.nonzero(dist > self.epsilon).view(-1)
+        success_stop_queries[working_ind] = query[working_ind]
+        for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
+            self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[
+                inside_batch_index].item()
+        bias = torch.zeros(x_adv.shape[0], 3, DIM, DIM)
+
+        best_dist = calc_norm(x_adv)
+
+        while torch.min(query) <= self.maximum_queries:
+
+            to_orig_direction = images - make_adv(x_adv)
+            od_norm = get_norm(to_orig_direction)
+
+            eta = self.sample_gaussian_torch(bias.size())
+            z = to_orig_direction.abs()
+            z = torch.nn.functional.interpolate(z, (DIM, DIM))
+            eta = eta * z + bias
+
+            if DIM < image_size:
+                eta_img = torch.nn.functional.interpolate(
+                    eta, (image_size, image_size)
+                )
+            else:
+                eta_img = eta
+
+            new_x_adv = x_adv + alpha.view(-1, 1, 1, 1) * to_orig_direction + beta * od_norm.view(-1, 1, 1, 1) * eta_img / get_norm(eta_img).view(-1, 1, 1, 1)
+            new_x_adv = torch.clamp(new_x_adv, 0, 1)
+
+            new_label = test(new_x_adv)
+            query += 1
+            # stats_adversarial.append(new_label)
+            dist = calc_norm(new_x_adv)
+
+            x_adv[new_label == 1] = new_x_adv[new_label == 1]
+            bias = (1 - m) * bias + m * eta * (new_label * 2 - 1).view(new_label.size(0), 1, 1, 1)
+            best_dist[new_label == 1] = torch.min(best_dist[new_label == 1], dist[new_label == 1])
+            # log(best_dist)
+            # labels.append(new_label)
+            # print(f"{batch_index}/{step}/{query.max()}: {dist.mean()}/{best_dist.mean()} {alpha.mean()}")
+
+            working_ind = torch.nonzero(dist > self.epsilon).view(-1)
+            success_stop_queries[working_ind] = query[working_ind]
+            for inside_batch_index, index_over_all_images in enumerate(batch_image_positions):
+                self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = best_dist[
+                    inside_batch_index].item()
+
+            expect_dist = alpha * od_norm + beta / get_norm(eta_img) * (eta_img.view(eta_img.size(0), -1) * to_orig_direction.view(to_orig_direction.size(0), -1)).sum(1)
+            actual_dist = od_norm - calc_norm(x_adv)
+            expect_dist = expect_dist.abs()
+            actual_dist = actual_dist.abs()
+            mul = torch.min(expect_dist, actual_dist) / (torch.max(expect_dist, actual_dist) + 1e-12)
+            muls.append(mul)
+
+            if len(muls) == 30:
+                m_mul = sum(muls) / len(muls)
+                alpha = alpha * ((m_mul + 0.8).pow(2))
+                muls.clear()
+                alpha[alpha < 1e-9] = 1e-2
+
+            log.info('Attacking image {} - {} / {}, distortion {}, query {}'.format(
+                batch_index * args.batch_size, (batch_index + 1) * args.batch_size, self.total_images, best_dist, query))
+            # if dist.item() < 1e-4:  # 发现攻击jpeg时候卡住，故意加上这句话
+            #     break
+
         success_stop_queries = torch.clamp(success_stop_queries, 0, self.maximum_queries)
-        return perturbed, query, success_stop_queries, dist, (dist <= self.epsilon)
+        return x_adv, query, success_stop_queries, dist, (dist <= self.epsilon)
 
     def attack_all_images(self, args, arch_name, result_dump_path):
+        assert self.norm == 'l2'
         if args.targeted and args.target_type == "load_random":
             loaded_target_labels = np.load("./target_class_labels/{}/label.npy".format(args.dataset))
             loaded_target_labels = torch.from_numpy(loaded_target_labels).long()
+
         for batch_index, (images, true_labels) in enumerate(self.dataset_loader):
             if args.dataset == "ImageNet" and self.model.input_size[-1] != 299:
                 images = F.interpolate(images,
@@ -429,9 +316,9 @@ class HopSkipJumpAttack(object):
                 logit = self.model(images.cuda())
             pred = logit.argmax(dim=1)
             correct = pred.eq(true_labels.cuda()).float()  # shape = (batch_size,)
-            if correct.int().item() == 0: # we must skip any image that is classified incorrectly before attacking, otherwise this will cause infinity loop in later procedure
-                log.info("{}-th original image is classified incorrectly, skip!".format(batch_index+1))
-                continue
+            # if correct.int().item() == 0: # we must skip any image that is classified incorrectly before attacking, otherwise this will cause infinity loop in later procedure
+            #     log.info("{}-th original image is classified incorrectly, skip!".format(batch_index+1))
+            #     continue
             selected = torch.arange(batch_index * args.batch_size, min((batch_index + 1) * args.batch_size, self.total_images))
             if args.targeted:
                 if args.target_type == 'random':
@@ -453,7 +340,7 @@ class HopSkipJumpAttack(object):
                 else:
                     raise NotImplementedError('Unknown target_type: {}'.format(args.target_type))
 
-                target_images = self.get_image_of_target_class(self.dataset_name,target_labels, self.model)
+                target_images = self.get_image_of_target_class(self.dataset_name, target_labels, self.model)
                 if target_images is None:
                     log.info("{}-th image cannot get a valid target class image to initialize!".format(batch_index+1))
                     continue
@@ -461,7 +348,7 @@ class HopSkipJumpAttack(object):
                 target_labels = None
                 target_images = None
 
-            adv_images, query, success_query, distortion_with_max_queries, success_epsilon = self.attack(batch_index, images, target_images, true_labels, target_labels)
+            adv_images, query, success_query, distortion_with_max_queries, success_epsilon = self.attack(batch_index, images, target_images, true_labels, target_labels, self.model.input_size[-1])
             distortion_with_max_queries = distortion_with_max_queries.detach().cpu()
             with torch.no_grad():
                 if adv_images.dim() == 3:
@@ -474,7 +361,8 @@ class HopSkipJumpAttack(object):
                 not_done = not_done * (1 - adv_pred.eq(target_labels.cuda()).float()).float()  # not_done初始化为 correct, shape = (batch_size,)
             else:
                 not_done = not_done * adv_pred.eq(true_labels.cuda()).float()  #
-            success = (1 - not_done.detach().cpu()) * correct.detach().cpu() * success_epsilon.float() *(success_query <= self.maximum_queries).float()
+            success = (1 - not_done.detach().cpu()) * correct.detach().cpu() * success_epsilon.detach().cpu() * (
+                    success_query.detach().cpu() <= self.maximum_queries).float()
 
             for key in ['query', 'correct', 'not_done',
                         'success', 'success_query', "distortion_with_max_queries"]:
@@ -502,26 +390,14 @@ class HopSkipJumpAttack(object):
         log.info("done, write stats info to {}".format(result_dump_path))
 
 
-def get_exp_dir_name(dataset,  norm, targeted, target_type, random_direction, args):
+def get_exp_dir_name(dataset,  norm, targeted, target_type, args):
     if target_type == "load_random":
         target_type = "random"
     target_str = "untargeted" if not targeted else "targeted_{}".format(target_type)
-    if args.init_num_eval_grad!=100:
-        if args.attack_defense:
-            dirname = 'HSJA@{}_on_defensive_model-{}-{}-{}'.format(args.init_num_eval_grad, dataset, norm, target_str)
-        else:
-            dirname = 'HSJA@{}-{}-{}-{}'.format(args.init_num_eval_grad, dataset, norm, target_str)
+    if args.attack_defense:
+        dirname = 'AHA_on_defensive_model-{}-{}-{}'.format(dataset,  norm, target_str)
     else:
-        if random_direction:
-            if args.attack_defense:
-                dirname = 'HSJARandom_on_defensive_model-{}-{}-{}'.format(dataset, norm, target_str)
-            else:
-                dirname = 'HSJARandom-{}-{}-{}'.format(dataset, norm, target_str)
-        else:
-            if args.attack_defense:
-                dirname = 'HSJA_on_defensive_model-{}-{}-{}'.format(dataset, norm, target_str)
-            else:
-                dirname = 'HSJA-{}-{}-{}'.format(dataset, norm, target_str)
+        dirname = 'AHA-{}-{}-{}'.format(dataset, norm, target_str)
     return dirname
 
 def print_args(args):
@@ -540,32 +416,27 @@ def set_log_file(fname):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu",type=int, required=True)
-    parser.add_argument('--json-config', type=str, default='./configures/HSJA.json',
+    parser.add_argument('--json-config', type=str, default='../configures/AHA.json',
                         help='a configures file to be passed in instead of arguments')
     parser.add_argument('--epsilon', type=float, help='the lp perturbation bound')
-    parser.add_argument("--norm",type=str, choices=["l2","linf"],required=True)
-    parser.add_argument('--batch-size', type=int, default=1, help='batch size must set to 1')
+    parser.add_argument("--norm", type=str, choices=["l2", "linf"], required=True)
+    parser.add_argument('--batch-size', type=int, default=10)
     parser.add_argument('--dataset', type=str, required=True,
                choices=['CIFAR-10', 'CIFAR-100', 'ImageNet', "FashionMNIST", "MNIST", "TinyImageNet"], help='which dataset to use')
     parser.add_argument('--arch', default=None, type=str, help='network architecture')
-    parser.add_argument('--all_archs', action="store_true")
+    parser.add_argument('--all-archs', action="store_true")
     parser.add_argument('--targeted', action="store_true")
-    parser.add_argument('--target_type',type=str, default='increment', choices=['random', "load_random", 'least_likely',"increment"])
+    parser.add_argument('--target-type',type=str, default='increment', choices=['random', "load_random", 'least_likely',"increment"])
     parser.add_argument('--exp-dir', default='logs', type=str, help='directory to save results and logs')
     parser.add_argument('--seed', default=0, type=int, help='random seed')
-    parser.add_argument('--attack_defense',action="store_true")
-    parser.add_argument("--num_iterations",type=int,default=64)
-    parser.add_argument('--stepsize_search', type=str, choices=['geometric_progression', 'grid_search'],default='geometric_progression')
-    parser.add_argument('--defense_model',type=str, default=None)
-    parser.add_argument('--defense_norm',type=str,choices=["l2","linf"],default='linf')
-    parser.add_argument('--defense_eps',type=str,default="")
-    parser.add_argument('--random_direction',action="store_true")
-    parser.add_argument('--max_queries',type=int, default=10000)
-    parser.add_argument('--init_num_eval_grad', type=int, default=100)
-    parser.add_argument('--gamma',type=float)
+    parser.add_argument('--attack-defense',action="store_true")
+    parser.add_argument('--defense-model',type=str, default=None)
+    parser.add_argument('--defense-norm',type=str,choices=["l2","linf"],default='linf')
+    parser.add_argument('--defense-eps',type=str,default="")
+    parser.add_argument('--max-queries',type=int, default=10000)
 
     args = parser.parse_args()
-    assert args.batch_size == 1, "HSJA only supports mini-batch size equals 1!"
+    # assert args.batch_size == 1, "HSJA only supports mini-batch size equals 1!"
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     args_dict = None
@@ -586,7 +457,7 @@ if __name__ == "__main__":
     if args.attack_defense and args.defense_model == "adv_train_on_ImageNet":
         args.max_queries = 20000
     args.exp_dir = osp.join(args.exp_dir,
-                            get_exp_dir_name(args.dataset, args.norm, args.targeted, args.target_type, args.random_direction, args))  # 随机产生一个目录用于实验
+                            get_exp_dir_name(args.dataset, args.norm, args.targeted, args.target_type, args))  # 随机产生一个目录用于实验
     os.makedirs(args.exp_dir, exist_ok=True)
 
     if args.all_archs:
@@ -667,9 +538,9 @@ if __name__ == "__main__":
             model = StandardModel(args.dataset, arch, no_grad=True)
         model.cuda()
         model.eval()
-        attacker = HopSkipJumpAttack(model, args.dataset, 0, 1.0, model.input_size[-2], model.input_size[-1], IN_CHANNELS[args.dataset],
-                                     args.norm, args.epsilon, args.num_iterations, gamma=args.gamma, stepsize_search=args.stepsize_search,
-                                     max_num_evals=1e4, init_num_evals=args.init_num_eval_grad,
-                                     maximum_queries=args.max_queries, random_direction=args.random_direction)
+        attacker = AHA(model, args.dataset, 0, 1.0, model.input_size[-2], model.input_size[-1], IN_CHANNELS[args.dataset],
+                       args.batch_size, args.norm, args.epsilon, args.max_queries)
         attacker.attack_all_images(args, arch, save_result_path)
         model.cpu()
+
+

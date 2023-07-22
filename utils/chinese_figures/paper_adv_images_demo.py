@@ -18,7 +18,7 @@ from SignOPT.sign_opt_linf_norm_attack import SignOptLinfNorm
 from boundary_attack.foolbox.attacks import BoundaryAttack
 from config import  CLASS_NUM, IN_CHANNELS, IMAGE_DATA_ROOT
 from dataset.target_class_dataset import ImageNetDataset, TinyImageNetDataset, CIFAR10Dataset, CIFAR100Dataset
-from hop_skip_jump_attack.attack import HotSkipJumpAttack
+from hop_skip_jump_attack.attack import HopSkipJumpAttack
 from models.standard_model import StandardModel
 from tangent_attack_hemisphere.attack import TangentAttack
 from tangent_attack_semiellipsoid.attack import EllipsoidTangentAttack
@@ -52,9 +52,9 @@ def construct_attack(max_queries, model, dataset, target_label, attack, targeted
             gamma = 10000.0
 
     if attack == "HSJA":
-        attacker = HotSkipJumpAttack(model, dataset, clip_min=0,clip_max=1.0,height=model.input_size[-2],
-                                     width=model.input_size[-1], channels=IN_CHANNELS[dataset],norm=norm,
-                                     epsilon=epsilon,gamma=gamma,maximum_queries=max_queries)
+        attacker = HopSkipJumpAttack(model, dataset, clip_min=0, clip_max=1.0, height=model.input_size[-2],
+                                     width=model.input_size[-1], channels=IN_CHANNELS[dataset], norm=norm,
+                                     epsilon=epsilon, gamma=gamma, maximum_queries=max_queries)
     elif attack == "BA":
         if not targeted:
             criterion = foolbox.criteria.Misclassification()
