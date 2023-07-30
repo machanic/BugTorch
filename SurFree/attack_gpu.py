@@ -124,9 +124,9 @@ class SurFree(object):
         images = torch.clamp(images, min=self.clip_min, max=self.clip_max).cuda()
         logits = self.model(images)
         if target_labels is None:
-            return logits.max(1)[1].detach().cpu() != true_labels
+            return logits.max(1)[1] != true_labels
         else:
-            return logits.max(1)[1].detach().cpu() == target_labels
+            return logits.max(1)[1] == target_labels
 
     def initialize(self, sample, target_images, true_labels, target_labels):
         """
@@ -137,7 +137,7 @@ class SurFree(object):
         num_eval = 0
         if target_images is None:
             while True:
-                random_noise = torch.from_numpy(np.random.uniform(self.clip_min, self.clip_max, size=self.shape)).float()
+                random_noise = torch.from_numpy(np.random.uniform(self.clip_min, self.clip_max, size=self.shape)).float().cuda()
                 # random_noise = torch.FloatTensor(*self.shape).uniform_(self.clip_min, self.clip_max)
                 success = self.decision_function(random_noise[None], true_labels, target_labels)[0].item()
                 num_eval += 1
@@ -147,7 +147,7 @@ class SurFree(object):
                     log.info("Initialization failed! Use a misclassified image as `target_image")
                     if target_labels is None:
                         target_labels = torch.randint(low=0, high=CLASS_NUM[self.dataset_name],
-                                                      size=true_labels.size()).long()
+                                                      size=true_labels.size()).long().cuda()
                         invalid_target_index = target_labels.eq(true_labels)
                         while invalid_target_index.sum().item() > 0:
                             target_labels[invalid_target_index] = torch.randint(low=0, high=CLASS_NUM[self.dataset_name],
@@ -180,9 +180,9 @@ class SurFree(object):
         num_evals = torch.zeros_like(true_labels).float()
 
         with torch.no_grad():
-            logit = self.model(samples.cuda())
+            logit = self.model(samples)
         pred = logit.argmax(dim=1)
-        correct = pred.eq(true_labels.cuda()).float()
+        correct = pred.eq(true_labels).float()
         for i in range(len(correct)):
             if correct[i]:
                 if target_images is None:
@@ -208,9 +208,9 @@ class SurFree(object):
         if self.quantification:
             perturbed = self._quantify(perturbed)
         if self.target_labels is not None:
-            is_advs = self.model(perturbed.cuda()).argmax(1).detach().cpu() == self.target_labels
+            is_advs = self.model(perturbed.cuda()).argmax(1) == self.target_labels
         else:
-            is_advs = self.model(perturbed.cuda()).argmax(1).detach().cpu() != self.label
+            is_advs = self.model(perturbed.cuda()).argmax(1) != self.label
 
         indexes = []
         for i, p in enumerate(perturbed):
@@ -455,14 +455,26 @@ class SurFree(object):
         return torch.where(mask, perturbed, (1.0 - epsilon) * originals + epsilon * perturbed)
 
     def attack(self, batch_index, images, target_images, true_labels, target_labels, **kwargs):
-        self._nqueries = torch.zeros(len(images)).to(images.device)
+        images = images.cuda()
+        true_labels = true_labels.cuda()
+        self._nqueries = torch.zeros(len(images)).cuda()
         self._history  = {i: [] for i in range(len(images))}
-        self.theta_max = torch.ones(len(images)).to(images.device) * self._theta_max
+        self.theta_max = torch.ones(len(images)).cuda() * self._theta_max
 
         self.label = true_labels
         self.X = images
-        self.target_labels = target_labels
         batch_size = images.size(0)
+
+        # Check if X are already adversarials.
+        if target_labels is None:
+            self._images_finished = model(images).argmax(1) != true_labels
+            self.target_labels = target_labels
+            target_images = target_images
+        else:
+            target_labels = target_labels.cuda()
+            target_images = target_images.cuda()
+            self._images_finished = model(images).argmax(1) == target_labels
+            self.target_labels = target_labels
 
         query = torch.zeros_like(true_labels).float()
         success_stop_queries = query.clone()  # stop query count once the distortion < epsilon
@@ -482,13 +494,7 @@ class SurFree(object):
             self.distortion_all[index_over_all_images][query[inside_batch_index].item()] = dist[
                 inside_batch_index].item()
 
-        # Check if X are already adversarials.
-        if target_labels is None:
-            self._images_finished = model(images.cuda()).argmax(1).detach().cpu() != true_labels
-        else:
-            self._images_finished = model(images.cuda()).argmax(1).detach().cpu() == target_labels
-
-        print("Already advs: ", self._images_finished.cpu().tolist())
+        # print("Already advs: ", self._images_finished.cpu().tolist())
         self.best_advs = torch.where(atleast_kdim(self._images_finished, len(images.shape)), images, self.best_advs)
         # self.best_advs = self._binary_search(self.best_advs, boost=True)
 
@@ -816,7 +822,7 @@ def set_log_file(fname):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu",type=int, required=True)
-    parser.add_argument('--json-config', type=str, default='../configures/SurFree.json',
+    parser.add_argument('--json-config', type=str, default='./configures/SurFree.json',
                         help='a configures file to be passed in instead of arguments')
     parser.add_argument('--epsilon', type=float, help='the lp perturbation bound')
     parser.add_argument("--norm",type=str, choices=["l2","linf"],required=True)

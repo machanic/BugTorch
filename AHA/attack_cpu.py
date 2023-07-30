@@ -416,7 +416,7 @@ def set_log_file(fname):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu",type=int, required=True)
-    parser.add_argument('--json-config', type=str, default='../configures/AHA.json',
+    parser.add_argument('--json-config', type=str, default='./configures/AHA.json',
                         help='a configures file to be passed in instead of arguments')
     parser.add_argument('--epsilon', type=float, help='the lp perturbation bound')
     parser.add_argument("--norm", type=str, choices=["l2", "linf"], required=True)
