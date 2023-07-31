@@ -1680,7 +1680,7 @@ def parse_args():
     parser.add_argument('--save-grad', action='store_true',
                         help='save grad after attacking step, if the adv image is significantly changed')
     parser.add_argument('--save-grad-dir', type=str,
-                        default='{}/train_pytorch_model/policy_driven_attack'.format(PROJECT_PATH),
+                        default='{}/train_pytorch_model/policy_driven_attack/pretrained_data'.format(PROJECT_PATH),
                         help='direction to save .npy files')
     parser.add_argument('--save-grad-pct', default=0.0, type=float,
                         help='save grad if distance args.save_grad_pct% in this iteration')
